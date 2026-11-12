@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import {
   ArrowDown, ArrowUpRight, Check, ChevronDown, CircleHelp, GraduationCap, Hash,
-  Headphones, Heart, Menu, MessageCircle, Orbit, Plus, Radio, Send, Settings2,
-  Smile, Sparkles, Users, X,
+  Headphones, Heart, Menu, MessageCircle, Orbit, Phone, Plus, Radio, Send, Settings2,
+  Smile, Sparkles, Users, Video, X,
 } from 'lucide-react';
 
 const starterRooms = [
@@ -18,6 +18,50 @@ function initials(name = '?') {
 
 function formatTime(value) {
   return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(value));
+}
+
+let jitsiApiPromise;
+
+function loadJitsiApi() {
+  if (window.JitsiMeetExternalAPI) return Promise.resolve();
+  if (!jitsiApiPromise) {
+    jitsiApiPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://meet.jit.si/external_api.js';
+      script.async = true;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+  return jitsiApiPromise;
+}
+
+function JitsiCall({ roomName, displayName }) {
+  const containerRef = useRef(null);
+  const [loadError, setLoadError] = useState(false);
+
+  useEffect(() => {
+    let api;
+    let cancelled = false;
+    loadJitsiApi().then(() => {
+      if (cancelled || !containerRef.current) return;
+      api = new window.JitsiMeetExternalAPI('meet.jit.si', {
+        roomName,
+        parentNode: containerRef.current,
+        width: '100%',
+        height: '100%',
+        userInfo: { displayName },
+        configOverwrite: { startWithAudioMuted: false, startWithVideoMuted: false },
+      });
+    }).catch(() => setLoadError(true));
+    return () => {
+      cancelled = true;
+      api?.dispose();
+    };
+  }, [roomName, displayName]);
+
+  return <div className="jitsi-frame" ref={containerRef}>{loadError && <p className="call-error">Could not load Jitsi. Check your connection and try again.</p>}</div>;
 }
 
 export default function App() {
@@ -36,6 +80,10 @@ export default function App() {
   const [roomError, setRoomError] = useState('');
   const [connected, setConnected] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [roomCall, setRoomCall] = useState(null);
+  const [activeCall, setActiveCall] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [outgoingCall, setOutgoingCall] = useState(null);
   const messageEnd = useRef(null);
   const inputRef = useRef(null);
   const currentRoom = rooms.find((room) => room.id === roomId) || rooms[0];
@@ -66,6 +114,21 @@ export default function App() {
     connection.on('history', (history) => setMessages(history));
     connection.on('message', (message) => setMessages((current) => [...current, message]));
     connection.on('people', (nextPeople) => setPeople(nextPeople));
+    connection.on('room-call-state', (call) => setRoomCall(call));
+    connection.on('room-call-ended', () => {
+      setRoomCall(null);
+      setActiveCall((current) => current?.kind === 'room' ? null : current);
+    });
+    connection.on('incoming-direct-call', (call) => setIncomingCall(call));
+    connection.on('direct-call-accepted', (call) => {
+      setOutgoingCall(null);
+      setActiveCall({ ...call, kind: 'direct' });
+    });
+    connection.on('direct-call-ended', () => {
+      setIncomingCall(null);
+      setOutgoingCall(null);
+      setActiveCall((current) => current?.kind === 'direct' ? null : current);
+    });
     connection.connect();
     connection.once('connect', () => {
       connection.emit('join', { name: nameInput }, (result) => {
@@ -121,6 +184,53 @@ export default function App() {
     });
   }
 
+  function startOrJoinRoomCall() {
+    if (!socket) return;
+    const event = roomCall ? 'join-room-call' : 'start-room-call';
+    socket.emit(event, (result) => {
+      if (result?.ok) setActiveCall({ ...result.call, kind: 'room' });
+      else setMessageError(result?.error || 'Could not join the room call.');
+    });
+  }
+
+  function startDirectCall(person) {
+    socket?.emit('start-direct-call', person.id, (result) => {
+      if (!result?.ok) {
+        setMessageError(result?.error || 'Could not start that call.');
+        return;
+      }
+      setOutgoingCall({ callId: result.callId, targetName: result.targetName });
+    });
+  }
+
+  function answerDirectCall() {
+    if (!incomingCall) return;
+    socket?.emit('accept-direct-call', incomingCall.callId, (result) => {
+      setIncomingCall(null);
+      if (!result?.ok) {
+        setMessageError(result?.error || 'That call is no longer available.');
+        return;
+      }
+      setActiveCall({ ...result, callId: incomingCall.callId, kind: 'direct' });
+    });
+  }
+
+  function declineDirectCall() {
+    if (incomingCall) socket?.emit('decline-direct-call', incomingCall.callId);
+    setIncomingCall(null);
+  }
+
+  function leaveCall() {
+    if (activeCall?.kind === 'direct') socket?.emit('end-direct-call', activeCall.callId);
+    if (activeCall?.kind === 'room' && activeCall.hostId === socket?.id) socket.emit('end-room-call');
+    setActiveCall(null);
+  }
+
+  function cancelOutgoingCall() {
+    if (outgoingCall) socket?.emit('end-direct-call', outgoingCall.callId);
+    setOutgoingCall(null);
+  }
+
   const joined = Boolean(name && socket);
 
   return (
@@ -170,6 +280,7 @@ export default function App() {
                   <div className="person-row" key={person.name}>
                     <span className="avatar" style={{ '--avatar': person.color }}>{initials(person.name)}</span>
                     <span className="person-name">{person.name}{person.name === name && <span className="you-tag">you</span>}</span>
+                    {person.id !== socket?.id && <button className="person-call-button" type="button" title={`Call ${person.name}`} aria-label={`Call ${person.name}`} disabled={Boolean(outgoingCall || activeCall)} onClick={() => startDirectCall(person)}><Phone size={14} /></button>}
                     <span className="online-indicator" />
                   </div>
                 ))}
@@ -194,7 +305,7 @@ export default function App() {
               <div className="room-title-line"><span className="title-hash"><Hash size={22} strokeWidth={2.4} /></span><h1>{currentRoom?.name || 'Main Chat'}</h1><span className="live-badge"><span /> LIVE</span></div>
               <p>{currentRoom?.topic || 'The shared class hangout.'}</p>
             </div>
-            <div className="room-header-right"><span className="room-presence"><Users size={15} /> {onlineCount}<span>here now</span></span><button className="icon-button room-options" type="button" aria-label="Room settings"><Settings2 size={18} /></button></div>
+            <div className="room-header-right"><span className="room-presence"><Users size={15} /> {onlineCount}<span>here now</span></span>{joined && <button className="call-button" type="button" onClick={startOrJoinRoomCall} title={roomCall ? 'Join the room call' : 'Start a room call'}><Video size={15} /><span>{roomCall ? 'Join call' : 'Call room'}</span></button>}<button className="icon-button room-options" type="button" aria-label="Room settings"><Settings2 size={18} /></button></div>
           </div>
 
           <div className="chat-scroll">
@@ -266,6 +377,26 @@ export default function App() {
               {roomError && <p className="form-error">{roomError}</p>}
               <div className="modal-actions"><button className="cancel-button" type="button" onClick={() => setRoomModal(false)}>Cancel</button><button className="join-button" type="submit">Create chatroom <Plus size={17} /></button></div>
             </form>
+          </section>
+        </div>
+      )}
+      {incomingCall && !activeCall && (
+        <div className="call-overlay">
+          <section className="incoming-call-dialog" role="alertdialog" aria-labelledby="incoming-call-title">
+            <span className="eyebrow">INCOMING CALL</span>
+            <h2 id="incoming-call-title">{incomingCall.callerName} is calling</h2>
+            <p>Answer to join their audio and video call.</p>
+            <div className="incoming-call-actions"><button className="cancel-button" type="button" onClick={declineDirectCall}>Decline</button><button className="join-button" type="button" onClick={answerDirectCall}><Phone size={16} /> Answer</button></div>
+          </section>
+        </div>
+      )}
+      {outgoingCall && !activeCall && <div className="outgoing-call-toast" role="status">Calling {outgoingCall.targetName}...<button type="button" onClick={cancelOutgoingCall}>Cancel</button></div>}
+      {activeCall && (
+        <div className="call-overlay">
+          <section className="call-window" role="dialog" aria-modal="true" aria-labelledby="call-title">
+            <header className="call-window-header"><div><span className="eyebrow">{activeCall.kind === 'room' ? 'ROOM CALL' : 'ONE-TO-ONE CALL'}</span><h2 id="call-title">{activeCall.kind === 'room' ? currentRoom?.name : `Call with ${activeCall.otherName}`}</h2></div><button className="icon-button call-close-button" type="button" aria-label="Leave call" title="Leave call" onClick={leaveCall}><X size={19} /></button></header>
+            <JitsiCall roomName={activeCall.roomName} displayName={name} />
+            <p className="call-privacy-note">Call audio and video are hosted by Jitsi. Anyone with the call link may be able to join.</p>
           </section>
         </div>
       )}

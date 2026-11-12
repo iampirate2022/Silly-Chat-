@@ -1,5 +1,6 @@
 import express from 'express';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -20,6 +21,8 @@ const starters = [
 const rooms = new Map(starters.map((room) => [room.id, { ...room, messages: [] }]));
 const people = new Map();
 const reservedNames = new Map();
+const roomCalls = new Map();
+const directCalls = new Map();
 const blockedNames = new Set(['admin', 'anonymous', 'guest', 'nobody', 'someone', 'test', 'user', 'asdf', 'qwerty', 'poop', 'butt', 'peepee', 'blah']);
 const namePattern = /^[\p{L}][\p{L}\p{M}' -]{1,23}$/u;
 
@@ -30,7 +33,7 @@ function safeRoom(room) {
 function roomPeople(roomId) {
   return [...people.values()]
     .filter((person) => person.roomId === roomId)
-    .map(({ name, color }) => ({ name, color }));
+    .map(({ id, name, color }) => ({ id, name, color }));
 }
 
 function sendRoomState(roomId) {
@@ -69,12 +72,13 @@ io.on('connection', (socket) => {
 
     const { name, key } = result;
     const color = ['#e7ff76', '#ff9d79', '#91e6d0', '#b9a2ff', '#ffd166'][people.size % 5];
-    const person = { name, key, color, roomId: 'main-chat' };
+    const person = { id: socket.id, name, key, color, roomId: 'main-chat' };
     people.set(socket.id, person);
     reservedNames.set(key, socket.id);
     socket.join('main-chat');
     reply({ ok: true, name, roomId: 'main-chat', rooms: [...rooms.values()].map(safeRoom) });
     socket.emit('history', rooms.get('main-chat').messages);
+    socket.emit('room-call-state', roomCalls.get('main-chat') || null);
     addMessage('main-chat', {
       id: `${Date.now()}-${socket.id}`,
       kind: 'system',
@@ -91,10 +95,24 @@ io.on('connection', (socket) => {
     if (person.roomId === roomId) return reply({ ok: true });
 
     const previousRoomId = person.roomId;
+    const activeRoomCall = roomCalls.get(previousRoomId);
+    if (activeRoomCall?.hostId === socket.id) {
+      roomCalls.delete(previousRoomId);
+      io.to(previousRoomId).emit('room-call-ended');
+    }
+    for (const [callId, call] of directCalls) {
+      if (call.callerId === socket.id || call.targetId === socket.id) {
+        directCalls.delete(callId);
+        const otherId = call.callerId === socket.id ? call.targetId : call.callerId;
+        io.to(otherId).emit('direct-call-ended');
+        socket.emit('direct-call-ended');
+      }
+    }
     socket.leave(previousRoomId);
     person.roomId = roomId;
     socket.join(roomId);
     socket.emit('history', nextRoom.messages);
+    socket.emit('room-call-state', roomCalls.get(roomId) || null);
     addMessage(previousRoomId, {
       id: `${Date.now()}-${socket.id}`,
       kind: 'system',
@@ -110,6 +128,86 @@ io.on('connection', (socket) => {
     sendRoomState(previousRoomId);
     sendRoomState(roomId);
     reply({ ok: true });
+  });
+
+  socket.on('start-room-call', (reply = () => {}) => {
+    const person = people.get(socket.id);
+    if (!person) return reply({ ok: false, error: 'Join the chat before starting a call.' });
+    let call = roomCalls.get(person.roomId);
+    if (!call) {
+      call = {
+        roomName: `SillyChat-${randomUUID().replaceAll('-', '')}`,
+        hostId: socket.id,
+        hostName: person.name,
+      };
+      roomCalls.set(person.roomId, call);
+      io.to(person.roomId).emit('room-call-state', call);
+    }
+    reply({ ok: true, call });
+  });
+
+  socket.on('join-room-call', (reply = () => {}) => {
+    const person = people.get(socket.id);
+    const call = person && roomCalls.get(person.roomId);
+    if (!call) return reply({ ok: false, error: 'There is no room call happening right now.' });
+    reply({ ok: true, call });
+  });
+
+  socket.on('end-room-call', (reply = () => {}) => {
+    const person = people.get(socket.id);
+    const call = person && roomCalls.get(person.roomId);
+    if (!call || call.hostId !== socket.id) return reply({ ok: false, error: 'Only the call host can end this room call.' });
+    roomCalls.delete(person.roomId);
+    io.to(person.roomId).emit('room-call-ended');
+    reply({ ok: true });
+  });
+
+  socket.on('start-direct-call', (targetId, reply = () => {}) => {
+    const caller = people.get(socket.id);
+    const target = people.get(targetId);
+    if (!caller || !target || targetId === socket.id || caller.roomId !== target.roomId) {
+      return reply({ ok: false, error: 'That person is no longer available in this room.' });
+    }
+    const isBusy = [...directCalls.values()].some((call) => call.callerId === targetId || call.targetId === targetId || call.callerId === socket.id || call.targetId === socket.id);
+    if (isBusy) return reply({ ok: false, error: 'One of you is already in a call.' });
+
+    const call = {
+      id: randomUUID(),
+      roomName: `SillyChat-${randomUUID().replaceAll('-', '')}`,
+      callerId: socket.id,
+      callerName: caller.name,
+      targetId,
+      targetName: target.name,
+      roomId: caller.roomId,
+    };
+    directCalls.set(call.id, call);
+    io.to(targetId).emit('incoming-direct-call', { callId: call.id, callerName: caller.name });
+    reply({ ok: true, callId: call.id, targetName: target.name });
+  });
+
+  socket.on('accept-direct-call', (callId, reply = () => {}) => {
+    const call = directCalls.get(callId);
+    if (!call || call.targetId !== socket.id || people.get(call.callerId)?.roomId !== call.roomId || people.get(call.targetId)?.roomId !== call.roomId) {
+      directCalls.delete(callId);
+      return reply({ ok: false, error: 'That call is no longer available.' });
+    }
+    io.to(call.callerId).emit('direct-call-accepted', { callId, roomName: call.roomName, otherName: call.targetName });
+    reply({ ok: true, roomName: call.roomName, otherName: call.callerName });
+  });
+
+  socket.on('decline-direct-call', (callId) => {
+    const call = directCalls.get(callId);
+    if (!call || call.targetId !== socket.id) return;
+    directCalls.delete(callId);
+    io.to(call.callerId).emit('direct-call-ended');
+  });
+
+  socket.on('end-direct-call', (callId) => {
+    const call = directCalls.get(callId);
+    if (!call || (call.callerId !== socket.id && call.targetId !== socket.id)) return;
+    directCalls.delete(callId);
+    const otherId = call.callerId === socket.id ? call.targetId : call.callerId;
+    io.to(otherId).emit('direct-call-ended');
   });
 
   socket.on('create-room', (payload, reply = () => {}) => {
@@ -150,6 +248,18 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const person = people.get(socket.id);
     if (!person) return;
+    const roomCall = roomCalls.get(person.roomId);
+    if (roomCall?.hostId === socket.id) {
+      roomCalls.delete(person.roomId);
+      io.to(person.roomId).emit('room-call-ended');
+    }
+    for (const [callId, call] of directCalls) {
+      if (call.callerId === socket.id || call.targetId === socket.id) {
+        directCalls.delete(callId);
+        const otherId = call.callerId === socket.id ? call.targetId : call.callerId;
+        io.to(otherId).emit('direct-call-ended');
+      }
+    }
     people.delete(socket.id);
     reservedNames.delete(person.key);
     addMessage(person.roomId, {
